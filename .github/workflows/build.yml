@@ -367,7 +367,7 @@ jobs:
               echo "*No changelog available*"
             fi
             echo ""
-            echo "**Full Commit History:** [Browse all commits](https://github.com/ramabondanp/android_kernel_common-6.1/commits/android14-6.1-staging)"
+            echo "**Full Commit History:** [Browse all commits](https://github.com/ahmed-alnassif/android_kernel_common-6.1/commits/a14-6.1)"
             echo ""
             echo "---"
             echo "**KernelSU Changelog (last 10 commits):**"
