@@ -86,7 +86,7 @@ log "Downloading Clang..."
 CLANG_BIN="$WORKDIR/neutron-clang/bin"
 mkdir -p "$WORKDIR/neutron-clang"
 cd "$WORKDIR/neutron-clang"
-bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") -S
+bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") -S &> /dev/null
 cd $OLDPWD
 if [ ! -d "$CLANG_BIN" ]; then
     echo "Error: Clang not found in ${CLANG_BIN}."
