@@ -285,6 +285,11 @@ AK3_ZIP_NAME=${AK3_ZIP_NAME//VARIANT/$VARIANT}
 log "Patching custom configs..."
 source $WORKDIR/patches/gki_defconfig.sh
 
+# Required for user-space I2C access from Termux/i2c-tools.
+# This should create /dev/i2c-* nodes when the kernel is booted.
+log "Enabling I2C character device support for /dev/i2c-*"
+config --enable CONFIG_I2C_CHARDEV
+
 # set localversion
 if [ "${TODO:-kernel}" = "kernel" ]; then
   LATEST_COMMIT_HASH=$(git rev-parse --short HEAD)
@@ -321,6 +326,14 @@ KMI_CHECK="$WORKDIR/py/kmi-check-6.x.py"
 log "Generating config..."
 make ${MAKE_ARGS[@]} "$KERNEL_DEFCONFIG"
 
+# Force and verify I2C_CHARDEV in the generated output config as well.
+# This protects us if the defconfig helper gets overridden by the GKI build flow.
+log "Forcing I2C_CHARDEV in generated .config"
+scripts/config --file "$OUTDIR/.config" -e I2C_CHARDEV
+make ${MAKE_ARGS[@]} olddefconfig
+
+log "Checking I2C_CHARDEV in generated .config"
+grep CONFIG_I2C_CHARDEV "$OUTDIR/.config" || true
 
 # SUSFS debugging
 if susfs_included; then
