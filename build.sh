@@ -428,11 +428,13 @@ cp "$KERNEL_IMAGE" .
 zip -r9 "$WORKDIR/$AK3_ZIP_NAME" ./*
 cd $OLDPWD
 
-if [ "$STATUS" != "BETA" ]; then
-  echo "BASE_NAME=$KERNEL_NAME-$VARIANT" >> $GITHUB_ENV
-  mkdir -p $RELEASE_DIR
-  mv $WORKDIR/*.zip $RELEASE_DIR
-fi
+# Always move generated AK3 zip into artifacts.
+# The workflow uploads artifacts/, so BETA builds also need the zip here.
+log "Moving generated AK3 zip to artifacts..."
+echo "BASE_NAME=$KERNEL_NAME-$VARIANT" >> $GITHUB_ENV
+mkdir -p "$RELEASE_DIR"
+mv "$WORKDIR"/*.zip "$RELEASE_DIR"/
+ls -lh "$RELEASE_DIR"
 
 if [ "$STATUS" != "BETA" ]; then
   (
