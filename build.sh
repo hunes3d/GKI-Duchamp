@@ -13,6 +13,10 @@ ANYKERNEL_REPO="https://github.com/ahmed-alnassif/AK3-GKID"
 KERNEL_DEFCONFIG="gki_defconfig"
 KERNEL_BRANCH="a14-6.1"
 
+# Fallback kernel source. Some forked workflow runs may not export KERNEL_REPO.
+# Without this, git clone silently fails/does nothing and $KSRC never exists.
+KERNEL_REPO="${KERNEL_REPO:-https://github.com/ahmed-alnassif/android_kernel_common-6.1}"
+
 # Set timezone
 sudo timedatectl set-timezone "$TIMEZONE" || export TZ="$TIMEZONE"
 
@@ -45,7 +49,18 @@ trap 'echo "!!! Received SIGINT at $(date)" >> "$BUILD_LOGS"' INT
 
 # Clone kernel source
 log "Cloning kernel source from $(simplify_gh_url "$KERNEL_REPO")"
-git clone -q --depth=1 "$KERNEL_REPO" -b "$KERNEL_BRANCH" "$KSRC"
+if ! git clone -q --depth=1 "$KERNEL_REPO" -b "$KERNEL_BRANCH" "$KSRC"; then
+  echo "Error: failed to clone kernel source."
+  echo "KERNEL_REPO=$KERNEL_REPO"
+  echo "KERNEL_BRANCH=$KERNEL_BRANCH"
+  exit 1
+fi
+
+if [ ! -f "$KSRC/Makefile" ]; then
+  echo "Error: kernel source was not cloned correctly; Makefile not found in $KSRC"
+  ls -la "$WORKDIR"
+  exit 1
+fi
 
 cd $KSRC
 LINUX_VERSION=$(make kernelversion)
