@@ -171,6 +171,9 @@ patch -p1 --fuzz=3 < "$KERNEL_PATCHES/common/use_unlikely_wrap_cpufreq.patch"
 log "Applying unicode_bypass_fix_6.1.patch"
 patch -p1 --fuzz=3 < "$KERNEL_PATCHES/common/unicode_bypass_fix_6.1.patch"
 
+log "Applying GKID 3P battery (virtual-FCC software fuel gauge)"
+patch -p1 --fuzz=3 < "$KERNEL_PATCHES/common/gkid_3p_battery_fixup.patch"
+
 log "Applying BBRv3 patches"
 patch -p1 --fuzz=3 < $KERNEL_PATCHES/bbrv3/bbrv3.patch
 

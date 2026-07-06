@@ -1,0 +1,307 @@
+From: hunes3d <hunes3d@users.noreply.github.com>
+Date: Mon, 6 Jul 2026 00:00:00 +0300
+Subject: [PATCH] power: supply: GKID 3P virtual-FCC software fuel gauge
+
+Software fuel gauge for a 3-cell parallel pack (~14550 mAh, 1S) sitting behind
+a locked single-cell clone gauge whose reported FCC saturates at ~1/3 of the
+real pack. The gauge's raw current and voltage are accurate for the whole pack,
+so state of charge is computed here by coulomb counting against a virtual FCC
+and published for the "bms" and "battery" supplies.
+
+The hot path is lock-free (WRITE_ONCE/READ_ONCE snapshot). SOC is seeded from
+open-circuit voltage, re-synced at the charge/discharge endpoints, and the pack
+resistance and full-charge capacity are learned at runtime.
+---
+ drivers/power/supply/power_supply_core.c | 261 +++++++++++++++++++++++
+ 1 file changed, 261 insertions(+)
+
+diff --git a/drivers/power/supply/power_supply_core.c b/drivers/power/supply/power_supply_core.c
+--- a/drivers/power/supply/power_supply_core.c
++++ b/drivers/power/supply/power_supply_core.c
+@@ -1128,16 +1128,286 @@
+ EXPORT_SYMBOL_GPL(power_supply_battery_bti_in_range);
+ 
++#include <linux/workqueue.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
++#include <linux/minmax.h>
++
++#define GKID_3P_FCC_UAH        14550000
++#define GKID_3P_DESIGN_UAH     15000000
++#define GKID_CC_INTERVAL_MS    2000
++#define GKID_REST_UA           60000
++#define GKID_VMAXD_UV          4480000
++#define GKID_VFULL_MV          4460
++#define GKID_VSHUT_MV          3400
++#define GKID_VLOW_MV           3600
++#define GKID_VLOW_SOC          8
++#define GKID_ITERM_UA          350000
++#define GKID_R_INIT_MOHM       30
++#define GKID_R_MIN_MOHM        5
++#define GKID_R_MAX_MOHM        150
++#define GKID_DI_MIN_UA         300000
++#define GKID_FCC_MIN_UAH       (GKID_3P_FCC_UAH / 10 * 7)
++#define GKID_FCC_MAX_UAH       (GKID_3P_FCC_UAH / 100 * 115)
++#define GKID_RECHG_UA          1500000
++#define GKID_VSEED_MIN_MV      3000
++#define GKID_VSEED_MAX_MV      4600
++#define GKID_DT_MAX_MS         60000
++#define GKID_LOWV_DEBOUNCE     3
++
++static struct delayed_work gkid_cc_dwork;
++
++static s64 gkid_rem_uah;
++static s64 gkid_fcc_uah = GKID_3P_FCC_UAH;
++static ktime_t gkid_last_ts;
++static bool gkid_ready;
++static int gkid_r_mohm = GKID_R_INIT_MOHM;
++static int gkid_prev_v, gkid_prev_i;
++static bool gkid_have_prev;
++static s64 gkid_q_since_full;
++static bool gkid_had_full;
++static int gkid_lowv_cnt;
++
++static int gkid_pub_soc = -1;
++static int gkid_pub_rem_uah;
++static int gkid_pub_fcc_uah = GKID_3P_FCC_UAH;
++
++static const struct { int mv; int soc; } gkid_ocv[] = {
++	{4420,100},{4350,95},{4280,90},{4200,80},{4120,70},{4060,60},
++	{4000,50},{3950,40},{3880,30},{3820,20},{3770,12},{3720,7},
++	{3650,4},{3500,1},{3300,0},
++};
++
++static int gkid_ocv_to_soc(int mv)
++{
++	int i;
++
++	if (mv >= gkid_ocv[0].mv)
++		return 100;
++	for (i = 1; i < ARRAY_SIZE(gkid_ocv); i++) {
++		if (mv >= gkid_ocv[i].mv) {
++			int m0 = gkid_ocv[i - 1].mv, s0 = gkid_ocv[i - 1].soc;
++			int m1 = gkid_ocv[i].mv,     s1 = gkid_ocv[i].soc;
++
++			return s1 + (mv - m1) * (s0 - s1) / (m0 - m1);
++		}
++	}
++	return 0;
++}
++
++static int gkid_raw(struct power_supply *psy, enum power_supply_property p)
++{
++	union power_supply_propval v = { 0 };
++
++	if (!psy || !psy->desc || !psy->desc->get_property)
++		return 0;
++	if (psy->desc->get_property(psy, p, &v))
++		return 0;
++	return v.intval;
++}
++
++static void gkid_cc_fn(struct work_struct *w)
++{
++	struct power_supply *bms = power_supply_get_by_name("bms");
++	ktime_t now = ktime_get();
++	int cur, volt, status, mv, mv_oc, soc;
++
++	if (!bms)
++		goto out;
++
++	cur    = gkid_raw(bms, POWER_SUPPLY_PROP_CURRENT_NOW);
++	volt   = gkid_raw(bms, POWER_SUPPLY_PROP_VOLTAGE_NOW);
++	status = gkid_raw(bms, POWER_SUPPLY_PROP_STATUS);
++	mv     = volt / 1000;
++
++	if (mv < GKID_VSEED_MIN_MV || mv > GKID_VSEED_MAX_MV) {
++		power_supply_put(bms);
++		goto out;
++	}
++
++	if (gkid_have_prev) {
++		int di = cur - gkid_prev_i;
++
++		if (di > GKID_DI_MIN_UA || di < -GKID_DI_MIN_UA) {
++			int dv = volt - gkid_prev_v;
++			int r  = (int)div_s64(-1000LL * dv, di);
++
++			if (r >= GKID_R_MIN_MOHM && r <= GKID_R_MAX_MOHM)
++				gkid_r_mohm += (r - gkid_r_mohm) / 8;
++		}
++	}
++	gkid_prev_v = volt;
++	gkid_prev_i = cur;
++	gkid_have_prev = true;
++
++	mv_oc = mv + (int)div_s64((s64)cur * gkid_r_mohm, 1000000);
++
++	if (!gkid_ready) {
++		soc = gkid_ocv_to_soc(mv_oc);
++		gkid_rem_uah = (s64)soc * gkid_fcc_uah / 100;
++		gkid_last_ts = now;
++		gkid_ready = true;
++	} else {
++		s64 dt_ms = ktime_ms_delta(now, gkid_last_ts);
++
++		if (dt_ms < 0)
++			dt_ms = 0;
++		if (dt_ms > GKID_DT_MAX_MS)
++			dt_ms = GKID_CC_INTERVAL_MS;
++		gkid_rem_uah += div_s64(-(s64)cur * dt_ms, 3600000);
++		gkid_last_ts = now;
++
++		if (cur > 0)
++			gkid_q_since_full += div_s64((s64)cur * dt_ms, 3600000);
++
++		if (cur < GKID_REST_UA && cur > -GKID_REST_UA) {
++			s64 ocv = (s64)gkid_ocv_to_soc(mv_oc) *
++				  gkid_fcc_uah / 100;
++			gkid_rem_uah += (ocv - gkid_rem_uah) / 64;
++		}
++	}
++
++	if (gkid_had_full && cur < -GKID_RECHG_UA) {
++		gkid_had_full = false;
++		gkid_q_since_full = 0;
++	}
++
++	if (status == POWER_SUPPLY_STATUS_FULL ||
++	    (mv >= GKID_VFULL_MV && cur <= 0 && cur > -GKID_ITERM_UA)) {
++		gkid_rem_uah = gkid_fcc_uah;
++		gkid_q_since_full = 0;
++		gkid_had_full = true;
++	}
++
++	if (mv_oc <= GKID_VLOW_MV) {
++		s64 span = GKID_VLOW_MV - GKID_VSHUT_MV;
++		s64 ceil = mv_oc - GKID_VSHUT_MV;
++
++		if (ceil < 0)
++			ceil = 0;
++		ceil = ceil * GKID_VLOW_SOC * gkid_fcc_uah / (100 * span);
++		if (gkid_rem_uah > ceil)
++			gkid_rem_uah = ceil;
++	}
++
++	if (mv <= GKID_VSHUT_MV && cur >= 0) {
++		if (++gkid_lowv_cnt >= GKID_LOWV_DEBOUNCE) {
++			if (gkid_had_full &&
++			    gkid_q_since_full > gkid_fcc_uah / 2) {
++				s64 f = clamp_t(s64, gkid_q_since_full,
++						GKID_FCC_MIN_UAH,
++						GKID_FCC_MAX_UAH);
++
++				gkid_fcc_uah = gkid_fcc_uah -
++					       (gkid_fcc_uah >> 2) + (f >> 2);
++				gkid_fcc_uah = clamp_t(s64, gkid_fcc_uah,
++						       GKID_FCC_MIN_UAH,
++						       GKID_FCC_MAX_UAH);
++			}
++			gkid_had_full = false;
++			gkid_rem_uah = 0;
++		}
++	} else {
++		gkid_lowv_cnt = 0;
++	}
++
++	gkid_rem_uah = clamp_t(s64, gkid_rem_uah, 0, gkid_fcc_uah);
++	soc = (int)div_s64(gkid_rem_uah * 100, gkid_fcc_uah);
++	soc = clamp(soc, 0, 100);
++
++	WRITE_ONCE(gkid_pub_fcc_uah, (int)gkid_fcc_uah);
++	WRITE_ONCE(gkid_pub_rem_uah, (int)gkid_rem_uah);
++	WRITE_ONCE(gkid_pub_soc, soc);
++
++	power_supply_put(bms);
++out:
++	schedule_delayed_work(&gkid_cc_dwork,
++			      msecs_to_jiffies(GKID_CC_INTERVAL_MS));
++}
++
++static void gkid_3p_fixup(struct power_supply *psy,
++			  enum power_supply_property psp,
++			  union power_supply_propval *val, int *rc)
++{
++	const char *n;
++	int soc;
++
++	if (!psy || !psy->desc || !val)
++		return;
++	n = psy->desc->name;
++	if (!n || (strcmp(n, "bms") && strcmp(n, "battery")))
++		return;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++		val->intval = READ_ONCE(gkid_pub_fcc_uah);
++		*rc = 0;
++		return;
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		val->intval = GKID_3P_DESIGN_UAH;
++		*rc = 0;
++		return;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		val->intval = GKID_VMAXD_UV;
++		*rc = 0;
++		return;
++	default:
++		break;
++	}
++
++	soc = READ_ONCE(gkid_pub_soc);
++	if (soc < 0)
++		return;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CAPACITY:
++		val->intval = soc;
++		*rc = 0;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
++		if (soc >= 100)
++			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
++		else if (soc >= 80)
++			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
++		else if (soc > 15)
++			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
++		else if (soc > 5)
++			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
++		else
++			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
++		*rc = 0;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_NOW:
++		val->intval = READ_ONCE(gkid_pub_rem_uah);
++		*rc = 0;
++		break;
++	default:
++		break;
++	}
++}
++
++static int __init gkid_3p_init(void)
++{
++	INIT_DELAYED_WORK(&gkid_cc_dwork, gkid_cc_fn);
++	schedule_delayed_work(&gkid_cc_dwork, msecs_to_jiffies(15000));
++	return 0;
++}
++late_initcall(gkid_3p_init);
++
+ int power_supply_get_property(struct power_supply *psy,
+ 			    enum power_supply_property psp,
+ 			    union power_supply_propval *val)
+ {
++	int rc;
++
+ 	if (atomic_read(&psy->use_cnt) <= 0) {
+ 		if (!psy->initialized)
+ 			return -EAGAIN;
+ 		return -ENODEV;
+ 	}
+ 
+-	return psy->desc->get_property(psy, psp, val);
++	rc = psy->desc->get_property(psy, psp, val);
++	gkid_3p_fixup(psy, psp, val, &rc);
++	return rc;
+ }
+ EXPORT_SYMBOL_GPL(power_supply_get_property);
